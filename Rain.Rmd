@@ -1,0 +1,667 @@
+---
+title: "Rain Days"
+author: "Claire Gellner"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+TO DO
+3. Tidy up the graphs -> some are redundant
+4. make it knit (aka data set clean up)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#load packages
+```{r}
+
+suppressMessages({
+  library(dplyr)
+  library(stringr)
+  library(mosaic)
+  library(stats)
+  library("DescTools")
+  library(caret)
+  library(klaR)
+  library(rpart)
+  library(rpart.plot)
+})
+```
+
+
+Seattle is the Emerald City because of the lush, evergreen foliage year-round, and the rain that makes the evergreens grow*.  But, if you've ever been to the other Washington (D.C.), you know that the nation's capital is a place of unending rain, surprise summer thunderstorms, and the occasional hurricane. Is Seattle really a rainier city? We'll find out.
+
+*Citations:
+https://www.thoughtco.com/why-is-seattle-the-emerald-city-2964993
+https://www.seattlepi.com/seattlenews/slideshow/Stereotypes-and-Seattle-144731.php
+
+Data sets: https://www.ncei.noaa.gov/access/past-weather/
+
+## Loading in Data & Data Cleaning
+
+Lets start with some data processing. Here, we load the data sets. For data, I chose the official NOAA weather records for both Seattle and Washington, DC. They span from the mid-1900s to present day. However, DC's records go a little further back beginning in the mid 30's, and Seattle in the late 40's. The data sets track the temperature and precipitation both for the day as well as the minimum and maximum.
+
+```{r}
+
+dc <- read.csv("DC.csv", header = TRUE)
+seattle <- read.csv("Seattle.csv", header = TRUE)
+head(dc)
+head(seattle)
+```
+
+Next, well make the data set a little easier to work with. In order to compbine them, we need to add the city name.
+
+```{r}
+
+dc$city <- "dc"
+seattle$city <- "seattle"
+```
+
+
+Both data sets have a number of empty values. Now, we find the empty cells.
+
+```{r}
+
+apply(is.na(dc),2,sum)
+apply(is.na(seattle),2,sum)
+
+```
+
+I inserted 0 for NA's in Precipitation and Snow columns. I also removed the first rows of the DC data since most of the values are blank. This also makes the DC data set date range closer to the years of the Seattle data.
+
+```{r}
+
+dc <- dc[-c(1:1749),]
+
+dc$PRCP..Inches.[is.na(dc$PRCP..Inches.)] <- 0
+dc$SNOW..Inches.[is.na(dc$SNOW..Inches.)] <- 0
+dc$SNWD..Inches.[is.na(dc$SNWD..Inches.)] <- 0
+
+seattle$PRCP..Inches.[is.na(seattle$PRCP..Inches.)] <- 0
+seattle$SNOW..Inches.[is.na(seattle$SNOW..Inches.)] <- 0
+seattle$SNWD..Inches.[is.na(seattle$SNWD..Inches.)] <- 0
+
+
+apply(is.na(dc),2,sum)
+apply(is.na(seattle),2,sum)
+```
+
+We also want to split up the dates. That way, they'll be easier to work with, able to be looked at as months and years separately, and be numbers instead of another data type.
+
+
+```{r}
+
+dc$date_split <- str_split_fixed(dc$Date,"/", 3)
+
+
+dc$Month <- dc$date_split[,1]
+dc$Day <- dc$date_split[,2]
+dc$Year <- dc$date_split[,3]
+
+
+seattle$date_split <- str_split_fixed(seattle$Date,"/", 3)
+
+seattle$Month <- seattle$date_split[,1]
+seattle$Day <- seattle$date_split[,2]
+seattle$Year <- seattle$date_split[,3]
+```
+
+Next, we can impute the remaining missing data. Making the temperature 0 doesn't make sense, but leaving it null could skew things. This way we can find a ballpark average for the month / year and impute the missing value with that average, and it'll probably be about right.
+
+```{r}
+seattle[c('Month', 'Day', "Year")] <- sapply(seattle[c('Month', 'Day', "Year")],
+                                             as.numeric)
+
+seattle.filterna <- seattle %>%
+  filter(!is.na(TAVG..Degrees.Fahrenheit.))
+            
+fit.lmna <- lm(TAVG..Degrees.Fahrenheit. ~ Month + Day + Year , data = seattle.filterna)
+            
+summary(fit.lmna)
+            
+seattle <- seattle %>% 
+  mutate(pred = predict(fit.lmna, .)) %>%
+  mutate(TAVG..Degrees.Fahrenheit. = ifelse(is.na(TAVG..Degrees.Fahrenheit.), pred,
+                                            TAVG..Degrees.Fahrenheit.))
+```
+
+Repeat for DC
+
+```{r}
+
+dc[c('Month', 'Day', "Year")] <- sapply(dc[c('Month', 'Day', "Year")],
+                                             as.numeric)
+
+dc.filterna <- dc %>%
+  filter(!is.na(TAVG..Degrees.Fahrenheit.))
+            
+fit.lmna2 <- lm(TAVG..Degrees.Fahrenheit. ~ Month + Day + Year , data = dc.filterna)
+            
+summary(fit.lmna2)
+            
+dc <- dc %>% 
+  mutate(pred = predict(fit.lmna2, .)) %>%
+  mutate(TAVG..Degrees.Fahrenheit. = ifelse(is.na(TAVG..Degrees.Fahrenheit.), pred,
+                                            TAVG..Degrees.Fahrenheit.))
+```
+
+Recheck for missing values.
+
+```{r}
+
+apply(is.na(dc),2,sum)
+apply(is.na(seattle),2,sum)
+
+```
+
+Yay! There's almost no more missing / empty values.
+
+
+Next, I'm adding a days with rain / precipitation column. This is a binary value to say if it's rained or not. This will be helpful for combining days with precipitation.
+
+```{r}
+
+dc$prcp_day <- ifelse(dc$PRCP..Inches. > 0 | dc$SNOW..Inches. > 0, "Yes", "No")
+seattle$prcp_day <- ifelse(seattle$PRCP..Inches. > 0 | seattle$SNOW..Inches. > 0, 
+                           "Yes", "No")
+
+```
+
+
+## Statistics
+
+Now, we can do some introductory statistics to determine if Seattle or DC actually has more rain. The first step is to build a set of tables that we can then combine to quickly read across the row. We're going to look at the average temperature, the precipitation days, and the inches of snow.
+
+```{r pressure, echo=FALSE}
+
+dc_degree <- favstats(dc$TAVG..Degrees.Fahrenheit.)
+dc_degree$city <- "DC"
+dc_degree$variable <- "Average Temp"
+
+dc_percip <- favstats(dc$PRCP..Inches.)
+dc_percip$city <- "DC"
+dc_percip$variable <- "Precipitaion"
+
+dc_snow <- favstats(dc$SNOW..Inches.)
+dc_snow$city <- "DC"
+dc_snow$variable <- "Snow Inches"
+
+dc_prcp <- favstats(dc$prcp_day)
+dc_prcp <- "DC"
+dc_prcp$variable <- "Percipitation Day"
+
+
+sea_degree <- favstats(seattle$TAVG..Degrees.Fahrenheit.)
+sea_degree$city <- "Seattle"
+sea_degree$variable <- "Average Temp"
+
+sea_percip <- favstats(seattle$PRCP..Inches.)
+sea_percip$city <- "Seattle"
+sea_percip$variable <- "Precipitaion"
+
+sea_snow <- favstats(seattle$SNOW..Inches.)
+sea_snow$city <- "Seattle"
+sea_snow$variable <- "Snow Inches"
+
+sea_prcp <- favstats(seattle$prcp_day)
+sea_prcp <- "Seattle"
+sea_prcp$variable <- "Percipitation Day"
+
+
+rbind(dc_degree, dc_percip, dc_snow, sea_degree, sea_percip, sea_snow)
+
+```
+
+From the table, DC has a higher average temperature, a higher average precipitation, and a higher average snow inches. However, they're pretty similar. And Seattle does have a higher max snow inches.
+
+Next, we can visualize some of these data points. Lets start with how many days it actually precipitated vs days it didn't.
+```{r}
+
+dc_prcp <- table(dc$prcp_day)
+barplot(t(dc_prcp),
+        main = "Precipitation Days in DC", 
+        col = c("darkblue"))
+
+```
+
+DC has had about 1/2 as many days with precipitation as days with no precipitation. 
+
+We can repeat this for Seattle.
+
+```{r}
+
+sea_prcp <- table(seattle$prcp_day)
+
+barplot(t(sea_prcp),
+        main = "Percipitation Days in DC", 
+        col = c("gray"))
+```
+However, Seattle has an almost even number of precipitation vs no- precipitation days. DC has fewer days with either rain or snow.
+
+```{r}
+
+comb <- rbind(dc, seattle)
+
+options(scipen=999)
+precip_corr <- ggplot(comb, aes(x=Year, y=PRCP..Inches.)) + 
+  geom_point(aes(col=city)) + 
+  geom_smooth(method="loess", se=F) + 
+  labs(title="Precipitation and City", 
+       y="Precipitation in Inches", 
+       x="Year")
+
+plot(precip_corr)
+```
+Here again, we see that there's not a huge amount of variation. However, overall, DC is surpassing Seattle in inches of precipitation year over year.
+
+## Visualizations
+
+Next, we'll make a set of introductory graphs for each city:
+
+#Precipitation by month
+
+```{r}
+
+ggplot(comb, aes(x=factor(Month, level=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y=PRCP..Inches., group = Month)) + 
+  geom_point() +
+  labs(title = "Percipitation Amounts by Month")+
+  xlab("Month")+
+  ylab("Inches of Rain")+
+  facet_grid(. ~ city)
+
+```
+
+This graph counts inches of rain by month for each city. Here, we see that DC's rainiest months are in the summer, while Seattle's rainiest months are in the winter. DC also has more instances of 4 inches of rain or more than Seattle does.
+
+
+#Histogram of precipitation by year
+
+We can take the comparative scatterplot above, and break it into a separate plot for both cities so we can see if there are any year over year trends.
+
+```{r fig.width=10, fig.height=6}
+
+ggplot(dc, aes(x=Year, y=PRCP..Inches., group = Month)) + 
+  geom_point() +
+  labs(title = "Percipitation Amounts by Year - DC")+
+  xlab("Year")+
+  ylab("Inches of Rain")+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1))
+
+ggplot(seattle, aes(x=Year, y=PRCP..Inches., group = Month)) + 
+  geom_point() +
+  labs(title = "Percipitation Amounts by Year - Seattle")+
+  xlab("Year")+
+  ylab("Inches of Rain")+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1))
+
+```
+
+This graph looks at the inches of rain per year. Here again, the range of inches is wider in DC, so DC has more rainier years than Seattle does. There is just more rain falling in DC overall.
+
+
+Next, we'll look at the number of precipitation days by month. This is based on the proportion tables we made above.
+
+```{r fig.width=10, fig.height=6}
+
+dc.crosstab.prop <- prop.table(table(dc$Month, dc$prcp_day),margin=1)
+print(dc.crosstab.prop)
+
+barplot(t(dc.crosstab.prop), beside = TRUE, 
+        main = "Proportions of Rain days by Month in DC", 
+        xlab = "Month", ylab = "Proportion", 
+        col = c("gray", "darkblue"))
+
+legend("topleft", legend = colnames(dc.crosstab.prop),
+       fill =  c("gray", "darkblue"))
+
+
+seattle.crosstab.prop <- prop.table(table(seattle$Month, seattle$prcp_day),margin=1)
+print(seattle.crosstab.prop)
+
+barplot(t(seattle.crosstab.prop), beside = TRUE, 
+        main = "Proportions of Rain days by Month in Seattle", 
+        xlab = "Month", ylab = "Proportion", 
+        col = c("gray", "darkblue"))
+
+legend("topleft", legend = colnames(seattle.crosstab.prop),
+       fill =  c("gray", "darkblue"))
+
+
+```
+
+Here again, we see that Seattle's rainiest months are in the winter, while DC's are in the spring and summer.
+
+
+Next, we'll look at rain days by year.
+
+```{r fig.width=10, fig.height=6}
+
+dc.crosstab.prop2 <- prop.table(table(dc$Year, dc$prcp_day),margin=1)
+print(dc.crosstab.prop2)
+
+barplot(t(dc.crosstab.prop2), beside = TRUE, 
+        main = "Proportions of Rain days by Year in DC", 
+        xlab = "Month", ylab = "Proportion", 
+        col = c("gray", "darkblue"))
+
+legend("topleft", legend = colnames(dc.crosstab.prop2),
+       fill =  c("gray", "darkblue"))
+
+
+seattle.crosstab.prop2 <- prop.table(table(seattle$Year, seattle$prcp_day),margin=1)
+print(seattle.crosstab.prop2)
+
+barplot(t(seattle.crosstab.prop2), beside = TRUE, 
+        main = "Proportions of Rain days by Year in Seattle", 
+        xlab = "Month", ylab = "Proportion", 
+        col = c("gray", "darkblue"))
+
+legend("topleft", legend = colnames(seattle.crosstab.prop2),
+       fill =  c("gray", "darkblue"))
+
+```
+
+Overall, the proportion of rainy to non-rainy days are consistent from year to year. But you can see some drought years, and some rainy years. Here again, the proportion of rainy to non-rainy days in Seattle is much more equal than in DC. DC has fewer rainy days. This graph highlights the starker contrast between the number of days with precipitation vs without precipitation in DC as compared to Seattle. There are more days without rain in DC than there are in Seattle.
+
+Now that we've seen that there ARE differences in the amount and proportion of precipitation days and inches of precipitation between DC and Seattle, we have to see if that is statistically significantly.
+
+This is an ANOVA of city and Rainfall.
+```{r fig.width=10, fig.height=6}
+
+#ANOVA
+out_percip <- aov(comb$PRCP..Inches.~comb$city)
+PostHocTest(out_percip,method="lsd")
+
+#Chi-Squared
+prcp_tab <- table(comb$prcp_day, comb$city)
+print(prcp_tab)
+chisq.test(prcp_tab)
+```
+The interaction of city and inches and days of precipitation is significant! This means that there IS a difference between DC and Seattle in terms of both the number of precipitation days, and the actual amount of precipitation received.
+
+
+Now we can move on to some fancy graphs.
+
+
+First! This is a lollipop graph of years with above average rainfall.
+
+```{r fig.width=10, fig.height=6}
+
+ggplot(dc, aes(x=Year, y=PRCP..Inches.)) + 
+  geom_point(size=3) + 
+  geom_segment(aes(x=Year, 
+                   xend=Year, 
+                   y=0, 
+                   yend=PRCP..Inches.)) + 
+  labs(title="Lollipop Chart", 
+       subtitle="Rain per Year - DC") + 
+  theme(axis.text.x = element_text(angle=65, vjust=0.6))
+
+
+ggplot(seattle, aes(x=Year, y=PRCP..Inches.)) + 
+  geom_point(size=3) + 
+  geom_segment(aes(x=Year, 
+                   xend=Year, 
+                   y=0, 
+                   yend=PRCP..Inches.)) + 
+  labs(title="Lollipop Chart", 
+       subtitle="Rain per Year - Seattle ") + 
+  theme(axis.text.x = element_text(angle=65, vjust=0.6))
+
+```
+This graph looks very similar to the one above. But the lollipop ends are fun.
+
+#Snow
+
+Now, we can take a quick look at the amount of snow, specifically. Until now, we've been lopping snow and rain in together.
+
+```{r fig.width=10, fig.height=6}
+
+ggplot(dc, aes(x=Year, y=SNWD..Inches.)) + 
+  geom_point(size=3) + 
+  geom_segment(aes(x=Year, 
+                   xend=Year, 
+                   y=0, 
+                   yend=SNWD..Inches.)) + 
+  labs(title="Lollipop Chart", 
+       subtitle="Snow per Year - DC") + 
+  theme(axis.text.x = element_text(angle=65, vjust=0.6))
+
+
+ggplot(seattle, aes(x=Year, y=SNWD..Inches.)) + 
+  geom_point(size=3) + 
+  geom_segment(aes(x=Year, 
+                   xend=Year, 
+                   y=0, 
+                   yend=SNWD..Inches.)) + 
+  labs(title="Lollipop Chart", 
+       subtitle="Snow per Year - Seattle") + 
+  theme(axis.text.x = element_text(angle=65, vjust=0.6))
+```
+
+DC is getting more snow over the last few years, but Seattle is getting less. DC also gets more snow on average overall. It's snowier in DC. This makes sense given what we've seen; DC has a more extreme climate compared to Seattle's more mild climate.
+
+
+## Predicting City based on rain
+
+As a final step we can see if it's possible to use the weather data available to predict the city. This will confirm if the two cities do have significantly different weather; different enough to use it to indicate one city vs the other.
+
+Because we are predicting between cities, we'll use classification models. There are a couple different ones we could choose. Let's try a couple different ones.
+
+# Logistic Model
+
+The first model is going to be a Logistic Model. First, let's set up the data. For log models, we can use 0 and 1 for prediction. That's a little weird for our scenario, but, in this case DC is 0 and Seattle is 1.
+```{r fig.width=10, fig.height=6}
+
+
+comb1 <- comb[,c("TAVG..Degrees.Fahrenheit.", "TMAX..Degrees.Fahrenheit.",
+                 "TMIN..Degrees.Fahrenheit.", "PRCP..Inches.", "SNOW..Inches.", "SNWD..Inches.",
+                 "city", "Month", "Day", "Year", "pred", "prcp_day")]
+
+comb1 <- na.exclude(comb1)
+set.seed(1234)
+
+comb1$city <- ifelse(comb1$city == "dc", 0, 1)
+
+#test and train
+train1 <- sample(1:nrow(comb1), 0.7 * nrow(comb1)) # Train index vector
+test1 <- seq(1:nrow(comb1))[-train1] # Test index vector
+
+#the model
+log.city <- glm(city ~ PRCP..Inches. + prcp_day + SNOW..Inches. + SNWD..Inches. + Month + Day + Year + TAVG..Degrees.Fahrenheit., family = binomial(link = "logit"), data = comb1[train1,])
+
+log.city <- glm(city ~ PRCP..Inches. + prcp_day + SNOW..Inches. + SNWD..Inches. + Month + Day + Year + TAVG..Degrees.Fahrenheit., family = "binomial", data = comb1[train1,])
+
+summary(log.city)
+
+logs <- c("2LL" = -2 * logLik(log.city), "Deviance" = deviance(log.city), "AIC" = AIC(log.city))
+logs
+
+log.odds <- coef(log.city) # Log-odds coefficients
+odds <- exp(coef(log.city)) # Converted to odds
+
+round(cbind("Log-Odds" = log.odds, "Odds" = odds), digits = 3)
+```
+
+From this model, we can see that all of the variables used are incredibly significant, except for Day, which is slightly less significant, but still significant.
+
+We can see that every increase in the temperature decreases the probability of the city being Seattle, as does increases in the presence of snow, while increases in the other variables increase the probability of the city in question being Seattle.
+
+Let's see how the model does with predictions and how accurate it is.
+
+```{r fig.width=10, fig.height=6}
+
+#McFadden R-Squared
+pscl::pR2(log.city)["McFadden"]
+
+#VarImp
+caret::varImp(log.city)
+
+#VIF
+car::vif(log.city)
+
+#ROC
+suppressMessages({library(ROCR)})
+
+comb.test1 <- comb1[test1,]
+predicted1 <- predict(log.city, comb.test1, type = "response")
+names(predicted1)
+
+roc_pred <- prediction(predictions = predicted1  , labels = comb.test1$city)
+roc_perf <- performance(roc_pred , "tpr" , "fpr")
+plot(roc_perf,
+     colorize = TRUE,
+     print.cutoffs.at= seq(0,1,0.05),
+     text.adj=c(-0.2,1.7))
+```
+
+From the VarImp, we can see that the average temperature, month, and if it's a percipitation day are the most impactful for for prediction. However, that's kind of weird, and doesn't really make sense. Both DC and Seattle have the same days and months, and the model isn't powerful enough to navigate the correlations between date and weather. We should redo this without dates! However, despite the interaction of date and weather, the VIF reveals that there IS NOT a (severe) multicollinearity problem!
+
+The ROC curve shows us that it's not a bad model!
+
+
+# LDA
+
+Another popular classification model is Linear Discriminant Analysis.
+
+```{r fig.width=10, fig.height=6}
+
+detach("package:klaR") 
+detach("package:MASS")
+
+
+comb_pred1 <- comb %>% select(-c(Date, date_split))
+comb_pred1$city <- as.factor(comb_pred1$city)
+
+library(klaR)
+library(MASS) #masks dplyr!
+
+#train and test sets
+train <- sample(1:nrow(comb_pred1), 0.7 * nrow(comb_pred1)) # Train index vector
+test <- seq(1:nrow(comb_pred1))[-train] # Test index vector
+
+
+#lda model
+city.lda <- lda(city ~ PRCP..Inches. + prcp_day + SNOW..Inches. + SNWD..Inches. + 
+                  Month + Day + Year + TAVG..Degrees.Fahrenheit. ,data = comb_pred1[train,])
+city.lda
+
+
+#use model to make predictions
+comb.test <- comb_pred1[test,]
+
+
+predicted <- predict(city.lda, comb.test)
+names(predicted)
+ 
+
+#accuracy of model
+mean(predicted$class==comb.test$city)
+
+#plotting the model
+#define data to plot
+lda_plot <- cbind(comb_pred1[train,], predict(city.lda)$x)
+
+#histogram
+p <- predict(city.lda, comb_pred1[train,])
+ldahist(data = p$x[,1], g = comb_pred1[train,]$city)
+
+#partition plot
+#partimat(city ~ PRCP..Inches. + prcp_day + SNOW..Inches. + SNWD..Inches. + 
+           #Month + Day + Year + TAVG..Degrees.Fahrenheit. ,data = comb_pred1[train,], 
+         #method = "lda")
+
+#confusion matrix
+
+p1 <- predict(city.lda, comb.test)$class
+tab <- table(Predicted = p1, Actual = comb.test$city)
+tab
+
+#confusion matrix stats
+TruN <- tab[1, 1] # True negatives; 
+TruP <- tab[2, 2] # True positives
+FalN <- tab[1, 2] # False negatives;  
+FalP <- tab[2, 1] # False positives
+TotN <- TruN + FalP  # Total negatives
+TotP <- TruP + FalN  # Total positives
+Tot <- TotN + TotP # Total
+
+Accuracy.Rate <- (TruN + TruP) / Tot; 
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity  <-  TruP / TotP; 
+Specificity <- TruN / TotN; 
+FalP.Rate <- 1 - Specificity
+
+lda.rates.50 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(lda.rates.50) <- c("Accuracy Rate", "Error Rate", "Sensitivity", "Specificity", "False Positives")
+
+lda.rates.50
+
+```
+This model is fairly accurate! So that's very exciting. It gets the right city from the weather data about 82% of the time. From the confusion matrix, we can see that the model predicts Seattle incorrectly as DC more often than it predicts DC as Seattle. It is very good at predicting DC accurately. Because DC was set as 0 and Seattle as 1, it is more often falling into a Type 1 error: falsely rejecting the null. In this case: falsely rejecting that the weather is from a city that isn't Seattle.
+
+The two histograms show the overlap between the discriminant functions. LDA works by finding orthogonal, straight lines within a multidimensional data space. Ideally, there isn't any overlap, and it's able to clearly group the data points. We see from the histograms here, that this isn't the case. There is actually a good bit of overlap between DC and Seattle. This may explain the difficulties the model has correctly predicting Seattle.
+
+
+# Trees
+
+And finally, you can't have classification models without having trees!
+
+```{r fig.width=10, fig.height=5}
+
+detach("package:klaR") 
+detach("package:DescTools")
+detach("package:caret")
+detach("package:MASS")
+
+comb1 <- comb %>% select(-c(Date, date_split, pred))
+comb1[c('city')] <- sapply(comb1[c('city')], as.factor)
+
+train <- sample(1:nrow(comb1), 0.7 * nrow(comb1)) # Train index vector
+test <- seq(1:nrow(comb1))[-train] # Test index vector
+
+comb1_train <- comb1[train,]
+comb1_test <- comb1[test,]
+
+tree <- rpart(city~., data=comb1_train, control=rpart.control(cp=.001))
+printcp(tree)
+
+best <- tree$cptable[which.min(tree$cptable[,"xerror"]),"CP"]
+
+#produce a pruned tree based on the best cp value
+pruned_tree <- prune(tree, cp=best)
+
+#plot the pruned tree
+prp(pruned_tree,
+    faclen=0, 
+    extra=1, 
+    roundint=F, 
+    digits=5)
+
+summary(pruned_tree)
+
+```
+
+The tree model can give us a better idea of which factors are being used to determine if a given day's weather happened in DC or Seattle. Clearly, there's a lot of decision points! From this tree, it seems that the average temperature, and the min and max temperature are the more useful weather indicators, taken in conjunction with the time of year. This is somewhat misleading though, since the tree can't interpret the date pieces as dates since we broke them out earlier. But! It does indicate that the amount of precipitation may not have been as impactfull as we thought.
+
+# Resources
+
+https://r-statistics.co/Top50-Ggplot2-Visualizations-MasterList-R-Code.html#google_vignette 
+https://stringr.tidyverse.org/reference/str_split.html
+https://stackoverflow.com/questions/4350440/split-data-frame-string-column-into-multiple-columns
+https://stackoverflow.com/questions/70262484/remove-a-specific-part-of-a-string-in-r-with-stringr
+https://rstudiodatalab.medium.com/solve-classification-problems-with-lda-an-r-powered-guide-82cf31ef3f07
+https://www.tutorialspoint.com/how-to-find-the-confusion-matrix-for-linear-discriminant-analysis-in-r
+https://www.r-bloggers.com/2021/05/linear-discriminant-analysis-in-r/
+https://www.statology.org/linear-discriminant-analysis-in-r/
+https://r-graph-gallery.com/
+https://r-statistics.co/Top50-Ggplot2-Visualizations-MasterList-R-Code.html#google_vignette
+https://libguides.princeton.edu/R-Visualization
+https://www.statology.org/r-glm-predict/
+https://www.theanalysisfactor.com/r-glm-plotting/
+https://www.statology.org/logistic-regression-in-r/
+https://exploration.stat.illinois.edu/learn/Logistic-Regression/Evaluating-your-Logistic-Regression-Model/
+https://rstudio-pubs-static.s3.amazonaws.com/672367_98c2123bb6f04d13b2ba70dfc5cee3a6.html
